@@ -351,6 +351,8 @@ struct RuntimeOption {
 
   static std::map<std::string, std::string> EnvVariables;
 
+  static int RepoRequestPathCacheSize;
+
   // Eval options
   static bool EnableZendIniCompat;
   static JitSerdesMode EvalJitSerdesMode;

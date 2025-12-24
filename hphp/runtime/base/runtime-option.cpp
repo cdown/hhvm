@@ -42,6 +42,7 @@
 #include "hphp/runtime/ext/hash/hash_murmur.h"
 #include "hphp/runtime/server/access-log.h"
 #include "hphp/runtime/server/cli-server.h"
+#include "hphp/runtime/server/request-path-cache.h"
 #include "hphp/runtime/server/files-match.h"
 #include "hphp/runtime/server/virtual-host.h"
 #include "hphp/runtime/vm/jit/mcgen-translate.h"
@@ -629,6 +630,7 @@ int64_t RuntimeOption::SocketDefaultTimeout = 60;
 
 std::map<std::string, std::string> RuntimeOption::ServerVariables;
 std::map<std::string, std::string> RuntimeOption::EnvVariables;
+int RuntimeOption::RepoRequestPathCacheSize = 0;
 
 std::map<std::string, std::string>& RuntimeOption::GetMetadata() {
   static std::map<std::string, std::string> Metadata;
@@ -1383,6 +1385,9 @@ void RuntimeOption::Load(
     // Eval
     static std::string jitSerdesMode;
     Config::Bind(jitSerdesMode, ini, config, "Eval.JitSerdesMode", "Off");
+    Config::Bind(RepoRequestPathCacheSize, ini, config,
+                 "Eval.RepoRequestPathCacheSize", RepoRequestPathCacheSize);
+    if (RepoRequestPathCacheSize < 0) RepoRequestPathCacheSize = 0;
 
     EvalJitSerdesMode = [&] {
       #define X(x) if (jitSerdesMode == #x) return JitSerdesMode::x
@@ -1455,6 +1460,8 @@ void RuntimeOption::Load(
                           Cfg::Eval::ProfileHWFastReads,
                           Cfg::Eval::ProfileHWExportInterval);
 
+    repoRequestPathCacheUpdateConfig();
+
     if (Cfg::Jit::Enabled && Cfg::Eval::RecordCodeCoverage) {
       throw std::runtime_error("Code coverage is not supported with "
         "Eval.Jit=true");
@@ -1504,6 +1511,7 @@ void RuntimeOption::Load(
     // the command line.
     Config::Iterate(vh_callback, ini, config, "VirtualHost");
     Cfg::Server::LowestMaxPostSize = VirtualHost::GetLowestMaxPostSize();
+    repoRequestPathCacheInvalidate();
   }
   {
     // IpBlocks

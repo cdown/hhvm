@@ -17,18 +17,250 @@
 
 #include <sys/stat.h>
 
+#include <folly/Bits.h>
+#include <folly/Hash.h>
+#include <folly/Range.h>
+#include <folly/portability/String.h>
 #include <folly/portability/Unistd.h>
 
+#include <algorithm>
+#include <cstring>
+#include <shared_mutex>
+#include <vector>
+
 #include "hphp/runtime/base/file-util.h"
+#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/static-string-table.h"
 #include "hphp/runtime/base/string-buffer.h"
+#include "hphp/runtime/base/string-data.h"
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/server/http-protocol.h"
+#include "hphp/runtime/server/request-path-cache.h"
 #include "hphp/runtime/server/static-content-cache.h"
 #include "hphp/runtime/server/transport.h"
 #include "hphp/runtime/server/virtual-host.h"
+#include "hphp/util/assertions.h"
+#include "hphp/util/ptr.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+namespace {
+
+struct RepoRequestPathCache {
+  struct Entry {
+    const VirtualHost* vhost{nullptr};
+    PackedPtr<const StringData> sourceRoot;
+    PackedPtr<const StringData> path;
+    size_t sourceHash{0};
+    size_t pathHash{0};
+    uint8_t state{0};
+  };
+
+  static bool enabled() {
+    return RuntimeOption::RepoAuthoritative &&
+           RuntimeOption::RepoRequestPathCacheSize > 0 &&
+           s_capacity > 0;
+  }
+
+  static void updateConfig() {
+    std::unique_lock<std::shared_mutex> lock(s_mutex);
+    s_size = 0;
+    if (!RuntimeOption::RepoAuthoritative ||
+        RuntimeOption::RepoRequestPathCacheSize <= 0) {
+      s_entries.clear();
+      s_capacity = 0;
+      s_maxEntries = 0;
+      return;
+    }
+    auto desired = static_cast<size_t>(RuntimeOption::RepoRequestPathCacheSize);
+    if (desired < 1) desired = 1;
+    desired = folly::nextPowTwo(desired * 2);
+    s_entries.assign(desired, Entry{});
+    s_capacity = desired;
+    s_maxEntries = std::max<size_t>(1, desired * 3 / 4);
+  }
+
+  static void invalidateAll() {
+    std::unique_lock<std::shared_mutex> lock(s_mutex);
+    for (auto& entry : s_entries) entry = Entry{};
+    s_size = 0;
+  }
+
+  static bool lookup(RequestURI& uri,
+                     const VirtualHost* vhost,
+                     folly::StringPiece sourceRoot,
+                     folly::StringPiece canonicalPath) {
+    if (!enabled() || canonicalPath.empty()) {
+      return false;
+    }
+    auto const sourceHash = hashSlice(sourceRoot);
+    auto const pathHash = hashSlice(canonicalPath);
+    auto const combined = hashKey(vhost, sourceHash, pathHash);
+
+    std::shared_lock<std::shared_mutex> lock(s_mutex);
+    if (!s_capacity) return false;
+    auto const mask = s_capacity - 1;
+    auto idx = combined & mask;
+    for (size_t i = 0; i < s_capacity; ++i) {
+      auto const& entry = s_entries[idx];
+      if (entry.state == 0) return false;
+      if (entry.vhost == vhost &&
+          entry.sourceHash == sourceHash &&
+          entry.pathHash == pathHash &&
+          equals(entry.sourceRoot.get(), sourceRoot) &&
+          equals(entry.path.get(), canonicalPath)) {
+        apply(uri, entry.sourceRoot.get(), entry.path.get());
+        return true;
+      }
+      idx = (idx + 1) & mask;
+    }
+    return false;
+  }
+
+  static bool shouldStore(const RequestURI& uri,
+                          folly::StringPiece canonicalPath) {
+    if (!enabled() || canonicalPath.empty()) return false;
+    if (uri.m_rewritten || uri.m_globalDoc || uri.m_defaultDoc ||
+        uri.m_done || uri.m_forbidden ||
+        !uri.m_origPathInfo.empty() || !uri.m_pathInfo.empty()) {
+      return false;
+    }
+    if (!isPhpRequest(uri)) return false;
+    auto const resolved = uri.m_path.slice();
+    if (resolved.size() != canonicalPath.size() ||
+        (resolved.size() &&
+         memcmp(resolved.data(), canonicalPath.data(), resolved.size()) != 0)) {
+      return false;
+    }
+    return true;
+  }
+
+  static void store(const VirtualHost* vhost,
+                    folly::StringPiece sourceRootSlice,
+                    folly::StringPiece canonicalSlice,
+                    const StringData* sourceRootStatic,
+                    const StringData* canonicalStatic) {
+    if (!enabled() || canonicalSlice.empty() || canonicalStatic == nullptr ||
+        sourceRootStatic == nullptr) {
+      return;
+    }
+    std::unique_lock<std::shared_mutex> lock(s_mutex);
+    if (s_size >= s_maxEntries || s_capacity == 0) return;
+
+    auto const sourceHash = hashSlice(sourceRootSlice);
+    auto const pathHash = hashSlice(canonicalSlice);
+    auto const combined = hashKey(vhost, sourceHash, pathHash);
+
+    auto const mask = s_capacity - 1;
+    auto idx = combined & mask;
+    for (;;) {
+      auto& entry = s_entries[idx];
+      if (entry.state == 0) {
+        entry.vhost = vhost;
+        entry.sourceRoot = PackedPtr<const StringData>(sourceRootStatic);
+        entry.path = PackedPtr<const StringData>(canonicalStatic);
+        entry.sourceHash = sourceHash;
+        entry.pathHash = pathHash;
+        entry.state = 1;
+        ++s_size;
+        return;
+      }
+      if (entry.vhost == vhost &&
+          entry.sourceHash == sourceHash &&
+          entry.pathHash == pathHash &&
+          entry.sourceRoot.get() == sourceRootStatic &&
+          entry.path.get() == canonicalStatic) {
+        return;
+      }
+      idx = (idx + 1) & mask;
+    }
+  }
+
+private:
+  static size_t hashSlice(folly::StringPiece slice) {
+    if (slice.empty()) return 0;
+    return folly::hash::fnv64_buf(slice.data(), slice.size());
+  }
+
+  static size_t hashKey(const VirtualHost* vhost,
+                        size_t sourceHash,
+                        size_t pathHash) {
+    auto hv = reinterpret_cast<uintptr_t>(vhost);
+    auto combined = folly::hash::hash_128_to_64(hv, sourceHash);
+    return folly::hash::hash_128_to_64(combined, pathHash);
+  }
+
+  static bool equals(const StringData* sd, folly::StringPiece slice) {
+    if (!sd) return slice.empty();
+    if (sd->size() != slice.size()) return false;
+    if (slice.empty()) return true;
+    return memcmp(sd->data(), slice.data(), slice.size()) == 0;
+  }
+
+  static void apply(RequestURI& uri,
+                    const StringData* sourceRoot,
+                    const StringData* canonicalPath) {
+    auto pathStr = String(const_cast<StringData*>(canonicalPath));
+    uri.m_path = pathStr;
+    uri.m_resolvedURL = String("/") + pathStr;
+    uri.m_origPathInfo.reset();
+    uri.m_pathInfo.reset();
+    if (sourceRoot && sourceRoot->size() != 0) {
+      uri.m_absolutePath = String(const_cast<StringData*>(sourceRoot)) + pathStr;
+    } else {
+      uri.m_absolutePath = pathStr;
+    }
+    uri.m_rewritten = false;
+    uri.m_defaultDoc = false;
+    uri.m_globalDoc = false;
+    uri.m_done = false;
+    uri.m_forbidden = false;
+    uri.processExt();
+  }
+
+  static bool isPhpRequest(const RequestURI& uri) {
+    const char* ext = uri.m_ext;
+    if (!ext) return true;
+
+    auto matches = [&] (const char* target) {
+      return strcasecmp(ext, target) == 0;
+    };
+
+    if (matches("php") || matches("hh") ||
+        matches("hack") || matches("hackpartial")) {
+      return true;
+    }
+
+    if (!RuntimeOption::PhpFileExtensions.empty()) {
+      return RuntimeOption::PhpFileExtensions.count(ext);
+    }
+
+    return false;
+  }
+
+  static std::shared_mutex s_mutex;
+  static std::vector<Entry> s_entries;
+  static size_t s_capacity;
+  static size_t s_maxEntries;
+  static size_t s_size;
+};
+
+std::shared_mutex RepoRequestPathCache::s_mutex;
+std::vector<RepoRequestPathCache::Entry> RepoRequestPathCache::s_entries;
+size_t RepoRequestPathCache::s_capacity{0};
+size_t RepoRequestPathCache::s_maxEntries{0};
+size_t RepoRequestPathCache::s_size{0};
+
+} // namespace
+
+void repoRequestPathCacheInvalidate() {
+  RepoRequestPathCache::invalidateAll();
+}
+
+void repoRequestPathCacheUpdateConfig() {
+  RepoRequestPathCache::updateConfig();
+}
 
 RequestURI::RequestURI(const VirtualHost *vhost, Transport *transport,
                        const std::string &pathTranslation,
@@ -84,6 +316,34 @@ bool RequestURI::process(const VirtualHost *vhost, Transport *transport,
   m_rewritten = false;
 
   auto scriptFilename = transport->getScriptFilename();
+  const bool allowRepoCache =
+    scriptFilename.empty() &&
+    RuntimeOption::RepoAuthoritative &&
+    RuntimeOption::RepoRequestPathCacheSize > 0 &&
+    pathTranslation.empty();
+  folly::StringPiece rootPiece{sourceRoot};
+
+  String lookupCanonical;
+  folly::StringPiece lookupPiece;
+  if (allowRepoCache) {
+    lookupCanonical = FileUtil::canonicalize(m_originalURL);
+    if (!lookupCanonical.isNull()) {
+      while (!lookupCanonical.empty() && lookupCanonical.charAt(0) == '/') {
+        lookupCanonical = lookupCanonical.substr(1);
+      }
+      if (!lookupCanonical.empty()) {
+        lookupPiece = lookupCanonical.slice();
+        if (RepoRequestPathCache::lookup(
+              *this,
+              vhost,
+              rootPiece,
+              lookupPiece)) {
+          return true;
+        }
+      }
+    }
+  }
+
   if (!scriptFilename.empty()) {
     // The transport is overriding everything and just handing us the filename
     m_originalURL = scriptFilename;
@@ -144,6 +404,21 @@ bool RequestURI::process(const VirtualHost *vhost, Transport *transport,
   if (!resolveURL(vhost, pathTranslation, sourceRoot)) {
     // Can't find
     return false;
+  }
+  if (allowRepoCache &&
+      !lookupPiece.empty() &&
+      RepoRequestPathCache::shouldStore(*this, lookupPiece)) {
+    auto pathSd = makeStaticString(lookupPiece);
+    auto rootSd = rootPiece.empty()
+      ? staticEmptyString()
+      : makeStaticString(rootPiece);
+    RepoRequestPathCache::store(
+      vhost,
+      rootPiece,
+      lookupPiece,
+      rootSd,
+      pathSd
+    );
   }
   return true;
 }
