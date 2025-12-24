@@ -323,16 +323,18 @@ bool RequestURI::process(const VirtualHost *vhost, Transport *transport,
     pathTranslation.empty();
   folly::StringPiece rootPiece{sourceRoot};
 
-  String lookupCanonical;
+  String canonicalOriginal;
+  String repoCanonical;
   folly::StringPiece lookupPiece;
   if (allowRepoCache) {
-    lookupCanonical = FileUtil::canonicalize(m_originalURL);
-    if (!lookupCanonical.isNull()) {
-      while (!lookupCanonical.empty() && lookupCanonical.charAt(0) == '/') {
-        lookupCanonical = lookupCanonical.substr(1);
+    canonicalOriginal = FileUtil::canonicalize(m_originalURL);
+    if (!canonicalOriginal.isNull()) {
+      repoCanonical = canonicalOriginal;
+      while (!repoCanonical.empty() && repoCanonical.charAt(0) == '/') {
+        repoCanonical = repoCanonical.substr(1);
       }
-      if (!lookupCanonical.empty()) {
-        lookupPiece = lookupCanonical.slice();
+      if (!repoCanonical.empty()) {
+        lookupPiece = repoCanonical.slice();
         if (RepoRequestPathCache::lookup(
               *this,
               vhost,
@@ -388,7 +390,9 @@ bool RequestURI::process(const VirtualHost *vhost, Transport *transport,
 
   // Fast path for files that exist
   if (vhost->checkExistenceBeforeRewrite()) {
-    String canon = FileUtil::canonicalize(m_originalURL);
+    String canon = canonicalOriginal.isNull()
+      ? FileUtil::canonicalize(m_originalURL)
+      : canonicalOriginal;
     if (virtualFileExists(vhost, sourceRoot, pathTranslation, canon)) {
       m_rewrittenURL = canon;
       m_resolvedURL = canon;
